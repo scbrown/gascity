@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
@@ -4997,6 +4998,16 @@ func TestDoStartRejectsStandaloneOnlyFlagsUnderSupervisor(t *testing.T) {
 	}
 }
 
+// stopManagedCityWantElapsed is the deliberate-wait contract for a city that
+// never closes mc.done under ShutdownTimeout = 20ms: the 20ms cancel grace plus
+// the 5x = 100ms forced-stop budget. The stopManagedCity tests below run inside
+// a testing/synctest bubble, so time.After / time.Since use the bubble's
+// virtual clock and elapsed is exactly the sum of the timers the code waited
+// on — host load cannot stretch it (subprocesses and scheduling take zero
+// virtual time) and a doubled forced wait (220ms) or an unbounded one cannot
+// hide under a loose wall-clock ceiling.
+const stopManagedCityWantElapsed = 20*time.Millisecond + 5*20*time.Millisecond
+
 func TestStopManagedCityForcesCleanupAfterTimeout(t *testing.T) {
 	cityPath := t.TempDir()
 	logFile := filepath.Join(t.TempDir(), "ops.log")
@@ -5004,50 +5015,52 @@ func TestStopManagedCityForcesCleanupAfterTimeout(t *testing.T) {
 	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 
-	closer := &closerSpy{}
-	forceStop := &atomic.Bool{}
-	mc := &managedCity{
-		name:   "bright-lights",
-		cancel: func() {},
-		done:   make(chan struct{}),
-		closer: closer,
-		cr: &CityRuntime{
-			cfg: &config.City{
-				Session: config.SessionConfig{StartupTimeout: "20ms"},
-				Daemon: config.DaemonConfig{
-					ShutdownTimeout:   "20ms",
-					DriftDrainTimeout: "20ms",
+	synctest.Test(t, func(t *testing.T) {
+		closer := &closerSpy{}
+		forceStop := &atomic.Bool{}
+		mc := &managedCity{
+			name:   "bright-lights",
+			cancel: func() {},
+			done:   make(chan struct{}),
+			closer: closer,
+			cr: &CityRuntime{
+				cfg: &config.City{
+					Session: config.SessionConfig{StartupTimeout: "20ms"},
+					Daemon: config.DaemonConfig{
+						ShutdownTimeout:   "20ms",
+						DriftDrainTimeout: "20ms",
+					},
 				},
+				sp:                runtime.NewFake(),
+				rec:               events.Discard,
+				stdout:            io.Discard,
+				stderr:            io.Discard,
+				forceStopShutdown: forceStop,
 			},
-			sp:                runtime.NewFake(),
-			rec:               events.Discard,
-			stdout:            io.Discard,
-			stderr:            io.Discard,
-			forceStopShutdown: forceStop,
-		},
-	}
+		}
 
-	var stderr bytes.Buffer
-	start := time.Now()
-	err := stopManagedCity(mc, cityPath, &stderr)
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("stopManagedCity took %s, want bounded timeout", elapsed)
-	}
-	if err == nil {
-		t.Fatal("stopManagedCity err = nil, want non-nil because city never exited")
-	}
-	if !strings.Contains(err.Error(), "did not exit") {
-		t.Fatalf("stopManagedCity err = %q, want 'did not exit' detail", err.Error())
-	}
-	if !strings.Contains(stderr.String(), "did not exit within") {
-		t.Fatalf("stderr = %q, want forced-timeout warning", stderr.String())
-	}
-	if !closer.closed {
-		t.Fatal("expected closer to be closed after forced cleanup")
-	}
-	if !forceStop.Load() {
-		t.Fatal("expected forced cleanup to request force-stop shutdown")
-	}
+		var stderr bytes.Buffer
+		start := time.Now()
+		err := stopManagedCity(mc, cityPath, &stderr)
+		if elapsed := time.Since(start); elapsed != stopManagedCityWantElapsed {
+			t.Fatalf("stopManagedCity took %s of virtual time, want exactly grace+forced = %s", elapsed, stopManagedCityWantElapsed)
+		}
+		if err == nil {
+			t.Fatal("stopManagedCity err = nil, want non-nil because city never exited")
+		}
+		if !strings.Contains(err.Error(), "did not exit") {
+			t.Fatalf("stopManagedCity err = %q, want 'did not exit' detail", err.Error())
+		}
+		if !strings.Contains(stderr.String(), "did not exit within") {
+			t.Fatalf("stderr = %q, want forced-timeout warning", stderr.String())
+		}
+		if !closer.closed {
+			t.Fatal("expected closer to be closed after forced cleanup")
+		}
+		if !forceStop.Load() {
+			t.Fatal("expected forced cleanup to request force-stop shutdown")
+		}
+	})
 
 	ops := readOpLog(t, logFile)
 	assertSingleStopWithBenignNoise(t, ops)
@@ -5060,45 +5073,55 @@ func TestStopManagedCityAllowsForcedShutdownToUnwind(t *testing.T) {
 	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 
-	done := make(chan struct{})
-	time.AfterFunc(60*time.Millisecond, func() {
-		close(done)
-	})
-	closer := &closerSpy{}
-	forceStop := &atomic.Bool{}
-	mc := &managedCity{
-		name:   "bright-lights",
-		cancel: func() {},
-		done:   done,
-		closer: closer,
-		cr: &CityRuntime{
-			cfg: &config.City{
-				Daemon: config.DaemonConfig{
-					ShutdownTimeout: "20ms",
+	synctest.Test(t, func(t *testing.T) {
+		// The city unwinds 60ms after cancel: past the 20ms grace (so the
+		// forced path runs) but inside the 100ms forced budget. On virtual
+		// time the two timers cannot become ready together under host load.
+		const unwindAfter = 60 * time.Millisecond
+		done := make(chan struct{})
+		time.AfterFunc(unwindAfter, func() {
+			close(done)
+		})
+		closer := &closerSpy{}
+		forceStop := &atomic.Bool{}
+		mc := &managedCity{
+			name:   "bright-lights",
+			cancel: func() {},
+			done:   done,
+			closer: closer,
+			cr: &CityRuntime{
+				cfg: &config.City{
+					Daemon: config.DaemonConfig{
+						ShutdownTimeout: "20ms",
+					},
 				},
+				sp:                runtime.NewFake(),
+				rec:               events.Discard,
+				stdout:            io.Discard,
+				stderr:            io.Discard,
+				forceStopShutdown: forceStop,
 			},
-			sp:                runtime.NewFake(),
-			rec:               events.Discard,
-			stdout:            io.Discard,
-			stderr:            io.Discard,
-			forceStopShutdown: forceStop,
-		},
-	}
+		}
 
-	var stderr bytes.Buffer
-	err := stopManagedCity(mc, cityPath, &stderr)
-	if err != nil {
-		t.Fatalf("stopManagedCity: %v; stderr=%q", err, stderr.String())
-	}
-	if !forceStop.Load() {
-		t.Fatal("expected forced cleanup to request force-stop shutdown")
-	}
-	if !closer.closed {
-		t.Fatal("expected closer to be closed after forced cleanup")
-	}
-	if strings.Contains(stderr.String(), "after forced shutdown") {
-		t.Fatalf("stderr = %q, want no forced-shutdown timeout", stderr.String())
-	}
+		var stderr bytes.Buffer
+		start := time.Now()
+		err := stopManagedCity(mc, cityPath, &stderr)
+		if err != nil {
+			t.Fatalf("stopManagedCity: %v; stderr=%q", err, stderr.String())
+		}
+		if elapsed := time.Since(start); elapsed != unwindAfter {
+			t.Fatalf("stopManagedCity took %s of virtual time, want to return as soon as the city unwinds (%s)", elapsed, unwindAfter)
+		}
+		if !forceStop.Load() {
+			t.Fatal("expected forced cleanup to request force-stop shutdown")
+		}
+		if !closer.closed {
+			t.Fatal("expected closer to be closed after forced cleanup")
+		}
+		if strings.Contains(stderr.String(), "after forced shutdown") {
+			t.Fatalf("stderr = %q, want no forced-shutdown timeout", stderr.String())
+		}
+	})
 
 	ops := readOpLog(t, logFile)
 	assertSingleStopWithBenignNoise(t, ops)
@@ -5111,57 +5134,62 @@ func TestStopManagedCityDoesNotUseStartupOrDriftTimeouts(t *testing.T) {
 	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 
-	closer := &closerSpy{}
-	mc := &managedCity{
-		name:   "bright-lights",
-		cancel: func() {},
-		done:   make(chan struct{}),
-		closer: closer,
-		cr: &CityRuntime{
-			cfg: &config.City{
-				Session: config.SessionConfig{StartupTimeout: "3m"},
-				Daemon: config.DaemonConfig{
-					ShutdownTimeout:   "20ms",
-					DriftDrainTimeout: "2m",
+	synctest.Test(t, func(t *testing.T) {
+		closer := &closerSpy{}
+		mc := &managedCity{
+			name:   "bright-lights",
+			cancel: func() {},
+			done:   make(chan struct{}),
+			closer: closer,
+			cr: &CityRuntime{
+				cfg: &config.City{
+					Session: config.SessionConfig{StartupTimeout: "3m"},
+					Daemon: config.DaemonConfig{
+						ShutdownTimeout:   "20ms",
+						DriftDrainTimeout: "2m",
+					},
 				},
+				sp:     runtime.NewFake(),
+				rec:    events.Discard,
+				stdout: io.Discard,
+				stderr: io.Discard,
 			},
-			sp:     runtime.NewFake(),
-			rec:    events.Discard,
-			stdout: io.Discard,
-			stderr: io.Discard,
-		},
-	}
+		}
 
-	var stderr bytes.Buffer
-	start := time.Now()
-	err := stopManagedCity(mc, cityPath, &stderr)
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("stopManagedCity took %s, want shutdown-timeout bound", elapsed)
-	}
-	if err == nil {
-		t.Fatal("stopManagedCity err = nil, want non-nil because city never exited")
-	}
-	if !strings.Contains(stderr.String(), "20ms") {
-		t.Fatalf("stderr = %q, want shutdown-timeout warning", stderr.String())
-	}
-	if !closer.closed {
-		t.Fatal("expected closer to be closed after forced cleanup")
-	}
+		var stderr bytes.Buffer
+		start := time.Now()
+		err := stopManagedCity(mc, cityPath, &stderr)
+		if elapsed := time.Since(start); elapsed != stopManagedCityWantElapsed {
+			t.Fatalf("stopManagedCity took %s of virtual time, want exactly the shutdown-timeout bound %s", elapsed, stopManagedCityWantElapsed)
+		}
+		if err == nil {
+			t.Fatal("stopManagedCity err = nil, want non-nil because city never exited")
+		}
+		if !strings.Contains(stderr.String(), "20ms") {
+			t.Fatalf("stderr = %q, want shutdown-timeout warning", stderr.String())
+		}
+		if !closer.closed {
+			t.Fatal("expected closer to be closed after forced cleanup")
+		}
+	})
 
 	ops := readOpLog(t, logFile)
 	assertSingleStopWithBenignNoise(t, ops)
 }
 
 // hangingListProvider wraps a runtime.Provider but makes ListRunning block
-// forever. This simulates a session/beads dependency call inside
+// until release closes. This simulates a session/beads dependency call inside
 // CityRuntime.shutdown that never returns (#5256) — ListRunning has no
-// context argument, so nothing can bound or cancel it from outside.
+// context argument, so nothing can bound or cancel it from outside. The test
+// releases it only after its assertions, so the synctest bubble can drain.
 type hangingListProvider struct {
 	runtime.Provider
+	release <-chan struct{}
 }
 
-func (hangingListProvider) ListRunning(string) ([]string, error) {
-	select {}
+func (p hangingListProvider) ListRunning(prefix string) ([]string, error) {
+	<-p.release
+	return p.Provider.ListRunning(prefix)
 }
 
 func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
@@ -5171,60 +5199,72 @@ func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
 	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 
-	closer := &closerSpy{}
-	forceStop := &atomic.Bool{}
-	mc := &managedCity{
-		name:   "bright-lights",
-		cancel: func() {},
-		done:   make(chan struct{}), // never closes: city never exits on its own
-		closer: closer,
-		cr: &CityRuntime{
-			cfg: &config.City{
-				Daemon: config.DaemonConfig{
-					ShutdownTimeout: "20ms",
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		done := make(chan struct{}) // never closes on its own: city never exits
+		// Unwind the bubble after the assertions: let the hung shutdown
+		// return and, should stopManagedCity itself be wedged on mc.done,
+		// let it finish so the failure is reported instead of a deadlock.
+		defer close(done)
+		defer close(release)
+
+		closer := &closerSpy{}
+		forceStop := &atomic.Bool{}
+		mc := &managedCity{
+			name:   "bright-lights",
+			cancel: func() {},
+			done:   done,
+			closer: closer,
+			cr: &CityRuntime{
+				cfg: &config.City{
+					Daemon: config.DaemonConfig{
+						ShutdownTimeout: "20ms",
+					},
 				},
+				sp:                hangingListProvider{Provider: runtime.NewFake(), release: release},
+				rec:               events.Discard,
+				stdout:            io.Discard,
+				stderr:            io.Discard,
+				forceStopShutdown: forceStop,
 			},
-			sp:                hangingListProvider{Provider: runtime.NewFake()},
-			rec:               events.Discard,
-			stdout:            io.Discard,
-			stderr:            io.Discard,
-			forceStopShutdown: forceStop,
-		},
-	}
+		}
 
-	var stderr bytes.Buffer
-	result := make(chan error, 1)
-	start := time.Now()
-	go func() {
-		result <- stopManagedCity(mc, cityPath, &stderr)
-	}()
+		var stderr bytes.Buffer
+		result := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			result <- stopManagedCity(mc, cityPath, &stderr)
+		}()
 
-	select {
-	case err := <-result:
-		// ShutdownTimeout is 20ms, so the forced-stop timeout (5x) is
-		// 100ms: the promised ceiling is grace(20ms) + forced(100ms) =
-		// 120ms. A double wait on the forced timeout — the regression
-		// this test guards against — pushes that to ~220ms, so the bound
-		// here must sit strictly below that, not at the old, much looser
-		// 500ms that a doubled wait still passed.
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
-			t.Fatalf("stopManagedCity took %s, want bounded near grace+forced (~120ms) even when CityRuntime.shutdown hangs", elapsed)
+		select {
+		case err := <-result:
+			// ShutdownTimeout is 20ms, so the forced-stop timeout (5x) is
+			// 100ms: the promised ceiling is grace(20ms) + forced(100ms) =
+			// 120ms. A double wait on the forced timeout — the regression
+			// this test guards against — pushes that to 220ms. On the
+			// bubble's virtual clock elapsed is exact, so assert equality.
+			if elapsed := time.Since(start); elapsed != stopManagedCityWantElapsed {
+				t.Fatalf("stopManagedCity took %s of virtual time, want exactly grace+forced = %s even when CityRuntime.shutdown hangs", elapsed, stopManagedCityWantElapsed)
+			}
+			if err == nil {
+				t.Fatal("stopManagedCity err = nil, want non-nil because city never exited and shutdown hung")
+			}
+			if !strings.Contains(err.Error(), "did not exit") {
+				t.Fatalf("stopManagedCity err = %q, want 'did not exit' detail", err.Error())
+			}
+			if !forceStop.Load() {
+				t.Fatal("expected forced cleanup to request force-stop shutdown")
+			}
+			if !closer.closed {
+				t.Fatal("expected closer to be closed even though CityRuntime.shutdown never returned")
+			}
+		case <-time.After(2 * time.Second):
+			// Virtual time: this fires only once every goroutine in the
+			// bubble is durably blocked past the 120ms contract, i.e. a
+			// genuine hang, never because the host is slow.
+			t.Fatal("stopManagedCity did not return within 2s: forced shutdown is not bounded when CityRuntime.shutdown hangs (issue #5256)")
 		}
-		if err == nil {
-			t.Fatal("stopManagedCity err = nil, want non-nil because city never exited and shutdown hung")
-		}
-		if !strings.Contains(err.Error(), "did not exit") {
-			t.Fatalf("stopManagedCity err = %q, want 'did not exit' detail", err.Error())
-		}
-		if !forceStop.Load() {
-			t.Fatal("expected forced cleanup to request force-stop shutdown")
-		}
-		if !closer.closed {
-			t.Fatal("expected closer to be closed even though CityRuntime.shutdown never returned")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("stopManagedCity did not return within 2s: forced shutdown is not bounded when CityRuntime.shutdown hangs (issue #5256)")
-	}
+	})
 }
 
 func TestCityRuntimeShutdownPreservesSessionsWhenRequested(t *testing.T) {
