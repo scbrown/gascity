@@ -2,7 +2,7 @@
 # the Bazel arm against the same commit so drift is caught early.
 #
 # Execution mode is env-driven:
-#   RBE_EXECUTOR  remote execution endpoint (grpc://...). Unset = local
+#   BAZEL_REMOTE_EXECUTOR  remote execution endpoint (grpc://...). Unset = local
 #                 execution only (no remote cache/exec), which keeps this
 #                 job green on fork PRs without farm access.
 #   RBE_TLS_CERT / RBE_TLS_KEY / RBE_TLS_CA
@@ -27,12 +27,12 @@ permissions:
 jobs:
   bazel:
     name: bazel test (side-by-side)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 90
     env:
       # Hoisted so the step-level `if:` below can see it (empty on forks,
       # where secrets are unavailable — the job then runs locally).
-      RBE_EXECUTOR: ${{ secrets.RBE_EXECUTOR }}
+      BAZEL_REMOTE_EXECUTOR: ${{ secrets.BAZEL_REMOTE_EXECUTOR }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -41,9 +41,15 @@ jobs:
           curl -sSfL -o /tmp/bazelisk \
             https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
           sudo install -m 0755 /tmp/bazelisk /usr/local/bin/bazel
+          # Blacksmith (gastownhall pool): the image user's ~/.cache is root-owned and the
+          # bazel JVM stats user.home/.cache regardless of HOME/output_user_root. Make it
+          # writable; also keep bazelisk state under the runner temp.
+          sudo chmod 755 /home/ubuntu
+          sudo mkdir -p /home/ubuntu/.cache && sudo chown "$(id -u):$(id -g)" /home/ubuntu/.cache
+          mkdir -p "$RUNNER_TEMP/bazel-home" && echo "BAZELISK_HOME=$RUNNER_TEMP/bazel-home" >> "$GITHUB_ENV"
 
       - name: Configure remote execution (if secrets present)
-        if: env.RBE_EXECUTOR != ''
+        if: env.BAZEL_REMOTE_EXECUTOR != ''
         env:
           RBE_TLS_CERT: ${{ secrets.RBE_TLS_CERT }}
           RBE_TLS_KEY: ${{ secrets.RBE_TLS_KEY }}
@@ -51,7 +57,7 @@ jobs:
           RBE_INSTANCE: ${{ secrets.RBE_INSTANCE }}
         run: |
           {
-            echo 'build:remote-exec --remote_executor='"$RBE_EXECUTOR"
+            echo 'build:remote-exec --remote_executor='"$BAZEL_REMOTE_EXECUTOR"
             [ -n "$RBE_INSTANCE" ] && echo 'build:remote-exec --remote_instance_name='"$RBE_INSTANCE"
             if [ -n "$RBE_TLS_CERT" ]; then
               printf '%s' "$RBE_TLS_CERT" | base64 -d > /tmp/rbe-cert.pem
@@ -75,14 +81,14 @@ jobs:
           }
 
       - name: bazel build //...
-        run: bazel build //...
+        run: bazel --output_user_root="$RUNNER_TEMP"/bazel-outputs build //... $( [ -f .bazelrc.local ] && echo --config=remote-exec )
 
       - name: bazel test //...
         run: |
           if [ -f .bazelrc.local ]; then
-            bazel test //... --config=remote-exec --test_output=errors --keep_going
+            bazel --output_user_root="$RUNNER_TEMP"/bazel-outputs test //... --config=remote-exec --test_output=errors --keep_going
           else
-            bazel test //... --test_output=errors --keep_going
+            bazel --output_user_root="$RUNNER_TEMP"/bazel-outputs test //... --test_output=errors --keep_going
           fi
 
       - name: Upload test logs
