@@ -5397,6 +5397,24 @@ func TestBackupScriptDiscoversNamedBackupsAndSyncsArtifactsOffsite(t *testing.T)
 	}
 }
 
+// writeRecordingTimeout installs a fake timeout that logs its arguments and
+// then runs the wrapped command. runtime.sh's run_bounded prefers gtimeout
+// over timeout, so the fake is installed under both names: otherwise, on a
+// host with GNU coreutils' gtimeout on PATH (Homebrew on macOS), the script
+// runs the real gtimeout and the fake never records.
+func writeRecordingTimeout(t *testing.T, binDir, logPath string) {
+	t.Helper()
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'timeout %%s\n' "$*" >> %s
+[ "$1" = "--kill-after=2" ] && shift
+shift
+exec "$@"
+`, shellQuote(logPath))
+	for _, name := range []string{"gtimeout", "timeout"} {
+		writeExecutable(t, filepath.Join(binDir, name), script)
+	}
+}
+
 func TestBackupScriptEscalatesOffsiteFailureWithConfiguredBound(t *testing.T) {
 	cityPath := t.TempDir()
 	dataDir := filepath.Join(cityPath, "dolt-data")
@@ -5417,12 +5435,7 @@ func TestBackupScriptEscalatesOffsiteFailureWithConfiguredBound(t *testing.T) {
 	_ = writeBackupFakeDolt(t, binDir, "2.1.0", 0, "prod")
 	_ = writeBackupFakeRsync(t, binDir, 1)
 	timeoutLogPath := filepath.Join(binDir, "timeout.log")
-	writeExecutable(t, filepath.Join(binDir, "timeout"), fmt.Sprintf(`#!/bin/sh
-printf 'timeout %%s\n' "$*" >> %s
-[ "$1" = "--kill-after=2" ] && shift
-shift
-exec "$@"
-`, shellQuote(timeoutLogPath)))
+	writeRecordingTimeout(t, binDir, timeoutLogPath)
 
 	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 		"GC_BACKUP_OFFSITE_PATH="+offsiteDir,
@@ -5480,12 +5493,7 @@ func TestBackupScriptRejectsUnusableOffsiteTimeout(t *testing.T) {
 			_ = writeBackupFakeDolt(t, binDir, "2.1.0", 0, "prod")
 			_ = writeBackupFakeRsync(t, binDir)
 			timeoutLogPath := filepath.Join(binDir, "timeout.log")
-			writeExecutable(t, filepath.Join(binDir, "timeout"), fmt.Sprintf(`#!/bin/sh
-printf 'timeout %%s\n' "$*" >> %s
-[ "$1" = "--kill-after=2" ] && shift
-shift
-exec "$@"
-`, shellQuote(timeoutLogPath)))
+			writeRecordingTimeout(t, binDir, timeoutLogPath)
 
 			out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 				"GC_BACKUP_OFFSITE_PATH="+offsiteDir,
