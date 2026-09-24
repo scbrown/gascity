@@ -248,7 +248,7 @@ func routeCityStatus(
 			cr, err = c.GetStatus()
 			return err
 		},
-		func() int { return renderCityStatusFromAPI(cityPath, cr, dops, jsonOutput, stdout) },
+		func() int { return renderCityStatusFromAPI(cityPath, cfg, cr, dops, jsonOutput, stdout) },
 		func() int {
 			store, diagnostic, code := openCityStatusStore(cityPath, stderr)
 			if code != 0 {
@@ -270,9 +270,12 @@ func routeCityStatus(
 //
 // Controller authority is not surfaced through the API response (the
 // server is the controller, so the CLI resolves that locally via
-// controllerStatusForCity — same call the fallback path makes).
-func renderCityStatusFromAPI(cityPath string, cr api.CachedRead[api.StatusView], dops drainOps, jsonOutput bool, stdout io.Writer) int {
+// controllerStatusForCity — same call the fallback path makes). Neither is
+// the config's session floor, so the CLI applies cityIdleByConfig to cfg
+// here, as the fallback snapshot does.
+func renderCityStatusFromAPI(cityPath string, cfg *config.City, cr api.CachedRead[api.StatusView], dops drainOps, jsonOutput bool, stdout io.Writer) int {
 	snapshot := snapshotFromStatusView(cityPath, cr.Body)
+	snapshot.IdleByConfig = cityIdleByConfig(cfg, cityPath, loadSuspensionStateBestEffort(cityPath))
 	if jsonOutput {
 		writeCityStatusJSONWithCache(snapshot, snapshot.Summary, cr.AgeSeconds, stdout)
 		return 0

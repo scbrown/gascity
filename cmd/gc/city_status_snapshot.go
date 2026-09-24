@@ -74,6 +74,11 @@ type cityStatusSnapshot struct {
 	Partial           bool
 	PartialErrors     []string
 	Summary           StatusSummaryJSON
+	// IdleByConfig reports that the loaded config keeps no session running
+	// (see cityIdleByConfig), so zero running agents is the configured steady
+	// state rather than a fault. The zero value keeps no_agents_running armed:
+	// a snapshot built without consulting config reports what it always did.
+	IdleByConfig bool
 }
 
 type cityStatusAgentRow struct {
@@ -186,6 +191,7 @@ func collectCityStatusSnapshotFromStoreSnapshot(
 
 	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	suspendedRigs := buildEffectiveSuspendedRigNames(cfg, suspState)
+	snapshot.IdleByConfig = cityIdleByConfig(cfg, cityPath, suspState)
 
 	rigCounts := make(map[string]*rigStatusCounts, len(cfg.Rigs))
 	addRigCount := func(rigName string, rowSuspended bool) {
@@ -444,6 +450,35 @@ func countCitySessionsFromSnapshot(snapshot *sessionBeadSnapshot) StatusSummaryJ
 	return summary
 }
 
+// cityIdleByConfig reports whether cfg lets the controller keep every session
+// stopped: no agent that is not effectively suspended has
+// min_active_sessions > 0, and no mode="always" named session has a template
+// that is not effectively suspended. Those are the parts of the controller's
+// desired state that config alone decides. Routed work can still wake an
+// on-demand pool, but only the controller sees that demand. A nil config is
+// not known to be idle.
+func cityIdleByConfig(cfg *config.City, cityPath string, st suspensionstate.State) bool {
+	if cfg == nil {
+		return false
+	}
+	for i := range cfg.Agents {
+		a := &cfg.Agents[i]
+		if a.EffectiveMinActiveSessions() > 0 && !isAgentEffectivelySuspendedWith(cfg, cityPath, a, st) {
+			return false
+		}
+	}
+	for i := range cfg.NamedSessions {
+		ns := &cfg.NamedSessions[i]
+		if ns.ModeOrDefault() != "always" {
+			continue
+		}
+		if a := config.FindAgent(cfg, ns.TemplateQualifiedName()); a != nil && !isAgentEffectivelySuspendedWith(cfg, cityPath, a, st) {
+			return false
+		}
+	}
+	return true
+}
+
 func cityStatusJSONFromSnapshot(snapshot cityStatusSnapshot, summary StatusSummaryJSON) StatusJSON {
 	agents := make([]StatusAgentJSON, 0, len(snapshot.Agents))
 	for _, row := range snapshot.Agents {
@@ -478,7 +513,10 @@ func cityStatusJSONFromSnapshot(snapshot cityStatusSnapshot, summary StatusSumma
 	switch {
 	case unknownAgents > 0:
 		signals = append(signals, "agent_state_unknown")
-	case summary.TotalAgents > 0 && summary.RunningAgents == 0:
+	// Nothing running is a fault only when config keeps something running. A
+	// city whose pools are all min=0 and whose always-on named sessions are
+	// suspended or absent is idle by design (gastownhall/gascity#6437).
+	case summary.TotalAgents > 0 && summary.RunningAgents == 0 && !snapshot.IdleByConfig:
 		signals = append(signals, "no_agents_running")
 	}
 	summary.UnknownAgents = unknownAgents

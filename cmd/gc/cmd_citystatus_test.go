@@ -1442,7 +1442,7 @@ func TestRenderCityStatusFromAPIPartialRendersUnknownNotStopped(t *testing.T) {
 	cr := api.CachedRead[api.StatusView]{Body: view}
 
 	var stdout bytes.Buffer
-	if code := renderCityStatusFromAPI(view.CityPath, cr, newFakeDrainOps(), false, &stdout); code != 0 {
+	if code := renderCityStatusFromAPI(view.CityPath, nil, cr, newFakeDrainOps(), false, &stdout); code != 0 {
 		t.Fatalf("code = %d, want 0", code)
 	}
 	out := stdout.String()
@@ -1455,7 +1455,7 @@ func TestRenderCityStatusFromAPIPartialRendersUnknownNotStopped(t *testing.T) {
 
 	// The JSON projection off the same view must also carry the partial flags.
 	var jsonOut bytes.Buffer
-	if code := renderCityStatusFromAPI(view.CityPath, cr, newFakeDrainOps(), true, &jsonOut); code != 0 {
+	if code := renderCityStatusFromAPI(view.CityPath, nil, cr, newFakeDrainOps(), true, &jsonOut); code != 0 {
 		t.Fatalf("json code = %d, want 0", code)
 	}
 	var status StatusJSON
